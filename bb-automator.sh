@@ -106,30 +106,27 @@ validate_input() {
 check_connectivity() {
     log_banner "CONNECTIVITE ET DNS"
     
-    # Skip DNS pour localhost/IP
-    if [[ "$TARGET" =~ ^(localhost|127\.0\.0\.1)(:[0-9]+)?$ ]]; then
-        log OK "Localhost: DNS skip"
-        TARGET_IP="127.0.0.1${TARGET#127.0.0.1}"
-    else
-        if ! host "$TARGET" >/dev/null 2>&1; then
-            die "Resolution DNS echouee: $TARGET"
-        fi
-        local ip=$(host "$TARGET" 2>/dev/null | head -1 | awk '{print $NF}')
-        log OK "DNS: $ip"
-        TARGET_IP="$ip"
+    # LOCALHOST : Skip DNS/ping
+    if [[ "$TARGET" =~ ^(localhost|127\.0?\.?0?\.?0?\.?1?)(:[0-9]+)?$ ]]; then
+        log OK "Localhost détecté → DNS/Ping skip"
+        return 0
     fi
     
-    # Ping seulement si pas localhost
-    if ! [[ "$TARGET_IP" =~ ^127\. ]]; then
-        if ping -c 1 -W 2 "$TARGET_IP" >/dev/null 2>&1; then
-            log OK "ICMP OK"
-        else
-            log WARN "ICMP timeout (normal WAF)"
-        fi
+    # DNS normal
+    if ! host "$TARGET" >/dev/null 2>&1; then
+        die "Resolution DNS échouée: $TARGET"
+    fi
+    local ip=$(host "$TARGET" 2>/dev/null | head -1 | awk '{print $NF}')
+    log OK "DNS: $ip"
+    
+    # Ping seulement domaines
+    if ping -c 1 -W 2 "$TARGET" >/dev/null 2>&1; then
+        log OK "ICMP OK"
     else
-        log OK "Localhost connectivité OK"
+        log WARN "ICMP timeout (normal derrière WAF)"
     fi
 }
+
 
 check_tools() {
     log_banner "VERIFICATION DEPENDANCES"
