@@ -208,7 +208,7 @@ run_httpx() {
         echo "$TARGET" > subdomains.txt
     fi
     
-    local cmd="cat subdomains.txt | httpx -silent -mc 200,301,302,403,401 -timeout 5 -rate-limit $HTTPX_RATE -o live-raw.txt"
+    local cmd="cat subdomains.txt | httpx -silent -mc 200,301,302 -timeout 5 -rate-limit $HTTPX_RATE -o live-raw.txt"
     [ -n "$PROXY" ] && cmd="$cmd -http-proxy $PROXY"
     
     if eval "$cmd"; then
@@ -227,14 +227,22 @@ parse_urls() {
     local input="$1"
     local output="$2"
     
-    if command -v jq &>/dev/null && file "$input" | grep -q "JSON"; then
-        jq -r '.url // .URL // .' "$input" 2>/dev/null > "$output" || \
-        grep -oP 'https?://[^\s\[\]"]+' "$input" > "$output"
-    else
-        sed -E 's/^\[//;s/\]$//;s/^https?:\/\///;s/^/http:\/\//' "$input" | \
-        grep -oP 'https?://[^\s]+' > "$output"
+    if [ ! -f "$input" ] || [ ! -s "$input" ]; then
+        log WARN "$input vide/absent -> skip"
+        touch "$output"
+        return 0
     fi
+    
+    cut -d'[' -f2 "$input" 2>/dev/null | \
+    cut -d']' -f1 2>/dev/null | \
+    grep '^https\?://' 2>/dev/null | \
+    sort -u > "$output" 2>/dev/null
+    
+    local count=$(wc -l < "$output" 2>/dev/null || echo 0)
+    log INFO "Parse: $count URLs propres ($output)"
 }
+
+
 
 # Katana - Web crawling
 run_katana() {
@@ -276,7 +284,7 @@ run_nuclei() {
     fi
     
     log INFO "Scan CVE..."
-    local cmd="cat live.txt | timeout 600 nuclei -rate-limit $NUCLEI_RATE -severity medium,high,critical -json -silent"
+    local cmd="cat live.txt | timeout 600 nuclei -rate-limit $NUCLEI_RATE -severity medium,high,critical -silent"
     [ -n "$PROXY" ] && cmd="$cmd -proxy $PROXY"
     cmd="$cmd -o nuclei-cve.json"
     
@@ -285,10 +293,11 @@ run_nuclei() {
         log OK "CVE detectes: $count"
     else
         log WARN "Nuclei CVE timeout"
+        touch nuclei-cve.json
     fi
     
     log INFO "Scan secrets..."
-    cmd="cat live.txt | timeout 300 nuclei -rate-limit $NUCLEI_RATE -tags exposure,secret,creds -json -silent"
+    cmd="cat live.txt | timeout 300 nuclei -rate-limit $NUCLEI_RATE -tags exposure,secret,creds -silent"
     [ -n "$PROXY" ] && cmd="$cmd -proxy $PROXY"
     cmd="$cmd -o nuclei-secrets.json"
     
@@ -297,6 +306,7 @@ run_nuclei() {
         log OK "Secrets detectes: $count"
     else
         log WARN "Nuclei secrets timeout"
+        touch nuclei-secrets.json
     fi
     
     log_timing "Nuclei"
@@ -312,12 +322,12 @@ run_subzy() {
         return 0
     fi
     
-    if timeout $TIMEOUT_FEROX subzy run --targets subdomains.txt -o takeover.json 2>/dev/null || true; then
-        local count=$(wc -l < takeover.json)
+    if timeout 300 subzy check -l subdomains.txt -o takeover.json 2>/dev/null || true; then
+        local count=$(jq 'length' takeover.json 2>/dev/null || echo 0)
         if [ "$count" -gt 0 ]; then
-            jq -r '.vulnerable // empty' takeover.json > takeover.txt 2>/dev/null || true
-            count=$(wc -l < takeover.txt)
-            log OK "Takeovers detectes: $count"
+            jq -r '.domains[]? | select(.vulnerable==true) | .domain' takeover.json > takeover.txt 2>/dev/null || true
+            local vuln_count=$(wc -l < takeover.txt 2>/dev/null || echo 0)
+            log OK "Takeovers detectes: $vuln_count"
         else
             log INFO "Aucun takeover"
             touch takeover.txt
@@ -365,23 +375,32 @@ run_ffuf_xss() {
     
     if [ ! -s gf-xss.txt ] || [ ! -s "$1" ]; then
         log WARN "Pas de params XSS ou wordlist absente"
-        touch ffuf-xss.json
+        touch ffuf-xss.json ffuf-xss.txt
         return 0
     fi
     
     local xss_wordlist="$1"
+    local count=0
     
-    if timeout $TIMEOUT_FFUF cat gf-xss.txt | \
-        ffuf -u FUZZ -w "$xss_wordlist" -mc 200,403 -rate "$FFUF_RATE" \
-        -json -o ffuf-xss.json 2>/dev/null || true; then
-        
-        local count=$(wc -l < ffuf-xss.json)
-        log OK "FFUF results: $count"
-    else
-        log WARN "FFUF timeout"
-        touch ffuf-xss.json
-    fi
+    while IFS= read -r url; do
+        # Extraire le paramètre (ex: /search?q=FUZZ)
+        if [[ "$url" =~ \?([^=]+)= ]]; then
+            local param="${BASH_REMATCH[1]}"
+            local base="${url%\?*}"
+            local fuzz_url="${base}?${param}=FUZZ"
+            
+            log INFO "Fuzzing: $fuzz_url"
+            timeout 60 ffuf -u "$fuzz_url" -w "$xss_wordlist" \
+                -mc 200,301,302,403 -rate 50 \
+                -o "ffuf-${count}.json" 2>/dev/null || true
+            
+            ((count++))
+        fi
+    done < gf-xss.txt
     
+    # Merger résultats
+    cat ffuf-*.json > ffuf-xss.json 2>/dev/null || touch ffuf-xss.json
+    log OK "FFUF XSS: $count URLs testées"
     log_timing "FFUF"
 }
 
