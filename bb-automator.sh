@@ -89,15 +89,17 @@ trap cleanup EXIT
 validate_input() {
     log_banner "VALIDATION ENTREES"
     
+    # Support localhost/IP:port pour test
+    if [[ "$TARGET" =~ ^(localhost|127\.0\.0\.1)(:[0-9]+)?$ ]]; then
+        log OK "Cible localhost/IP détectée: $TARGET"
+        return 0
+    fi
+    
     TARGET=$(echo "$TARGET" | sed 's|^https\?://||;s|^www\.||;s|/$||')
     log INFO "Cible: $TARGET"
     
     if ! [[ "$TARGET" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
         die "Format domaine invalide: $TARGET"
-    fi
-    
-    if [ -n "$PROXY" ]; then
-        log INFO "Proxy: $PROXY"
     fi
 }
 
