@@ -21,10 +21,10 @@ LOG_FILE="execution.log"
 : > "$LOG_FILE"
 PHASE_START_TIME=0
 
-
-TIMEOUT_KATANA=300
-TIMEOUT_FEROX=600
-TIMEOUT_FFUF=180
+export TIMEOUT_KATANA=600
+export NUCLEI_RATE=100
+export HTTPX_RATE=100
+export SUBFINDER_PROVIDERS="chaos,shodan,censys"
 
 HTTPX_RATE=50
 NUCLEI_RATE=50
@@ -199,7 +199,7 @@ run_subfinder() {
         return 0
     fi
     
-    local cmd="subfinder -d $TARGET -silent"
+    local cmd="subfinder -d $TARGET -all -silent -providers $SUBFINDER_PROVIDERS -t 100 -o subdomains.txt"
     [ -n "$PROXY" ] && cmd="$cmd -proxy $PROXY"
     
     if eval "$cmd -o subdomains.txt"; then
@@ -276,7 +276,7 @@ run_katana() {
         return 0
     fi
     
-    local cmd="timeout $TIMEOUT_KATANA cat live.txt | katana -silent -depth 2 -timeout 5"
+    local cmd="timeout $TIMEOUT_KATANA cat live.txt | katana -silent -depth 3 -timeout 10 -c 50 -rl 100 -js-crawl"
     [ -n "$PROXY" ] && cmd="$cmd -proxy $PROXY"
     cmd="$cmd -o urls.txt"
     
@@ -319,7 +319,7 @@ run_nuclei() {
     fi
     
     log INFO "Scan secrets..."
-    cmd="cat live.txt | timeout 300 nuclei -rate-limit $NUCLEI_RATE -tags exposure,secret,creds -silent"
+    cmd="cat live.txt | timeout 300 nuclei -rate-limit $NUCLEI_RATE -tags cve,known,kit,token,exposure,default-login -silent"
     [ -n "$PROXY" ] && cmd="$cmd -proxy $PROXY"
     cmd="$cmd -o nuclei-secrets.json"
     
