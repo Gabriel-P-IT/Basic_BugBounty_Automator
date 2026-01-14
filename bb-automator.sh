@@ -1,126 +1,639 @@
 #!/bin/bash
 
-# Bug Bounty Automator v1.0
+################################################################################
+# Bug Bounty Automator v2.2
+# 
+#
+# Usage: ./bb-automator.sh example.com [proxy_url]
+################################################################################
 
-set -e  # Stop on error
+set -euo pipefail
 
-TARGET=$1
-if [ -z "$TARGET" ]; then
-  echo "Usage: $0 <target.com>"
-  exit 1
-fi
+TARGET="${1:?Erreur: target requis}"
+PROXY="${2:-}"
+TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
+OUTPUT_DIR="bb-${TARGET}-${TIMESTAMP}"
 
-echo "Bug Bounty Automator v1.0 - $TARGET"
-mkdir -p bb-$TARGET
-cd bb-$TARGET
+mkdir -p "$OUTPUT_DIR"
+cd "$OUTPUT_DIR"
 
-# ================
-# CHECK TOOLS 
-# ================
-echo "Vérification des dépendances..."
+LOG_FILE="execution.log"
+: > "$LOG_FILE"
+PHASE_START_TIME=0
 
-TOOLS=("subfinder" "httpx" "katana" "nuclei" "subzy" "gf" "bxss" "feroxbuster")
-MISSING=()
 
-for tool in "${TOOLS[@]}"; do
-  if ! command -v $tool &> /dev/null; then
-    MISSING+=($tool)
-  fi
-done
 
-if [ ${#MISSING[@]} -ne 0 ]; then
-  echo "Outils manquants : ${MISSING[*]}"
-  exit 1
-fi
 
-echo "Tous les tools sont présents"
+TIMEOUT_KATANA=300
+TIMEOUT_FEROX=600
+TIMEOUT_FFUF=180
 
-# ========================================
-# CHOIX WORDLIST
-# ========================================
-echo ""
-echo "Choix de la wordlist pour Feroxbuster :"
-echo "[1] directory-list-2.3-medium.txt"
-echo "[2] directory-list-2.3-small.txt (rapide)"
-echo "[3] common.txt (ultra-rapide)"
-echo "[4] Personnalisée (chemin absolu)"
+HTTPX_RATE=50
+NUCLEI_RATE=50
+FFUF_RATE=100
 
-read -p "Choix (1-4) : " CHOIX
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-case $CHOIX in
-  1) WORDLIST="/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt" ;;
-  2) WORDLIST="/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt" ;;
-  3) WORDLIST="/usr/share/wordlists/dirbuster/common.txt" ;;
-  4) read -p "Chemin wordlist : " WORDLIST ;;
-  *) echo "Choix invalide, utilisation medium" ; WORDLIST="/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt" ;;
-esac
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    local color=""
+    
+    case "$level" in
+        INFO)  color="$BLUE" ;;
+        OK)    color="$GREEN" ;;
+        WARN)  color="$YELLOW" ;;
+        ERR)   color="$RED" ;;
+        *)     color="$NC" ;;
+    esac
+    
+    printf "${color}[${timestamp}] [${level}]${NC} ${message}\n" | tee -a "$LOG_FILE"
+}
 
-echo "Wordlist : $WORDLIST"
+log_banner() {
+    echo "" | tee -a "$LOG_FILE"
+    printf "════════════════════════════════════════════════════════\n" | tee -a "$LOG_FILE"
+    printf "  $1\n" | tee -a "$LOG_FILE"
+    printf "════════════════════════════════════════════════════════\n" | tee -a "$LOG_FILE"
+    echo "" | tee -a "$LOG_FILE"
+    PHASE_START_TIME=$(date +%s)
+}
 
-# ========================================
-# Début du WOrkflow
-# ========================================
-echo ""
-echo "Début du Workflow"
+log_timing() {
+    local phase="$1"
+    local elapsed=$(( $(date +%s) - PHASE_START_TIME ))
+    log OK "$phase - Temps: ${elapsed}s"
+}
 
-# 1. Subdomains
-echo "[1/9] Subfinder..."
-subfinder -d $TARGET -silent -o subdomains.txt 2>/dev/null || echo "Subfinder OK"
+die() {
+    log ERR "FATAL: $*"
+    exit 1
+}
 
-# 2. Live hosts
-echo "[2/9] Httpx..."
-cat subdomains.txt | httpx -silent -status-code -mc 200,301,302,403 -o live.txt
+cleanup() {
+    local exit_code=$?
+    if [ $exit_code -eq 0 ]; then
+        log OK "Archivage en cours..."
+        tar -czf "${OUTPUT_DIR}.tar.gz" "$OUTPUT_DIR" 2>/dev/null || true
+        log OK "Archive: ${OUTPUT_DIR}.tar.gz"
+    else
+        log WARN "Script interrompu (code $exit_code)"
+    fi
+}
+trap cleanup EXIT
 
-# 3. Crawling
-echo "[3/9] Katana..."
-timeout 300 cat live.txt | katana -silent -o urls.txt
+validate_input() {
+    log_banner "VALIDATION ENTREES"
+    
+    TARGET=$(echo "$TARGET" | sed 's|^https\?://||;s|^www\.||;s|/$||')
+    log INFO "Cible: $TARGET"
+    
+    if ! [[ "$TARGET" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
+        die "Format domaine invalide: $TARGET"
+    fi
+    
+    if [ -n "$PROXY" ]; then
+        log INFO "Proxy: $PROXY"
+    fi
+}
 
-# 4. Nuclei secrets
-echo "[4/9] Nuclei secrets..."
-cat urls.txt | nuclei -t ~/nuclei-templates/exposures/ -silent -o nuclei-secrets.txt 2>/dev/null || touch nuclei-secrets.txt
+check_connectivity() {
+    log_banner "CONNECTIVITE ET DNS"
+    
+    if ! host "$TARGET" >/dev/null 2>&1; then
+        die "Resolution DNS echouee: $TARGET"
+    fi
+    local ip=$(host "$TARGET" 2>/dev/null | head -1 | awk '{print $NF}')
+    log OK "DNS: $ip"
+    
+    if ping -c 1 -W 2 "$TARGET" >/dev/null 2>&1; then
+        log OK "ICMP OK"
+    else
+        log WARN "ICMP timeout (normal derriere WAF)"
+    fi
+}
 
-# 5. Nuclei CVE
-echo "[5/9] Nuclei CVE..."
-cat live.txt | nuclei -severity medium,high,critical -silent -o nuclei-cve.txt 2>/dev/null || touch nuclei-cve.txt
+check_tools() {
+    log_banner "VERIFICATION DEPENDANCES"
+    
+    local tools=("subfinder" "httpx" "katana" "nuclei" "subzy" "gf" "ffuf" "feroxbuster" "jq" "curl" "grep")
+    local missing=()
+    
+    for tool in "${tools[@]}"; do
+        if command -v "$tool" &>/dev/null; then
+            log OK "$tool OK"
+        else
+            missing+=("$tool")
+        fi
+    done
+    
+    if [ ${#missing[@]} -ne 0 ]; then
+        die "Outils manquants: ${missing[*]}"
+    fi
+}
 
-# 6. Takeover
-echo "[6/9] Subzy..."
-timeout 120 cat subdomains.txt | subzy run -o takeover.txt
+check_wordlists() {
+    log_banner "VERIFICATION WORDLISTS"
+    
+    local ferox_wordlist=""
+    for path in \
+        "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt" \
+        "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt" \
+        "/opt/wordlists/dirbuster-medium.txt"; do
+        if [ -f "$path" ]; then
+            ferox_wordlist="$path"
+            break
+        fi
+    done
+    
+    if [ -z "$ferox_wordlist" ]; then
+        die "Wordlist dirbuster introuvable. Installe seclists."
+    fi
+    
+    log OK "Feroxbuster wordlist detectee"
+    echo "$ferox_wordlist"
+}
 
-# 7. GF patterns
-echo "[7/9] GF vuln URLs..."
-cat urls.txt | gf xss > gf-xss.txt 2>/dev/null || touch gf-xss.txt
-cat urls.txt | gf lfi > gf-lfi.txt 2>/dev/null || touch gf-lfi.txt
-cat urls.txt | gf sqli > gf-sqli.txt 2>/dev/null || touch gf-sqli.txt
+setup_nuclei() {
+    log_banner "CONFIGURATION NUCLEI"
+    
+    if ! nuclei -update-templates >/dev/null 2>&1; then
+        log WARN "Update templates echouee"
+    else
+        log OK "Templates mises a jour"
+    fi
+    
+    local templates_path="$HOME/.nuclei-templates"
+    if [ -d "$templates_path" ]; then
+        log OK "Templates detectes"
+        echo "$templates_path"
+    else
+        die "Templates nuclei introuvables apres update"
+    fi
+}
 
-# 8. Bxss (si XSS candidates)
-if [ -s gf-xss.txt ]; then
-  echo "[8/9] Bxss auto-XSS..."
-  timeout 300 cat gf-xss.txt | bxss -o bxss-results.txt 2>/dev/null || touch bxss-results.txt
-else
-  touch bxss-results.txt
-fi
+# Subfinder - Enumeration sous-domaines
+run_subfinder() {
+    log_banner "PHASE 1: SUBFINDER"
+    
+    local cmd="subfinder -d $TARGET -silent"
+    [ -n "$PROXY" ] && cmd="$cmd -proxy $PROXY"
+    
+    if eval "$cmd -o subdomains.txt"; then
+        local count=$(wc -l < subdomains.txt)
+        if [ "$count" -gt 0 ]; then
+            log OK "Subfinder: $count subdomaines"
+            log_timing "Subfinder"
+            return 0
+        else
+            log WARN "Subfinder: aucun resultat"
+            return 1
+        fi
+    else
+        log ERR "Subfinder echoue"
+        return 1
+    fi
+}
 
-# 9. Directory bruteforce
-echo "[9/9] Feroxbuster ($WORDLIST)..."
-timeout 600 cat live.txt | feroxbuster --stdin -w "$WORDLIST" -x js,html,php -o ferox.txt 2>/dev/null || echo "Ferox timeout OK"
+# HTTPX - Validation HTTP et resolution
+run_httpx() {
+    log_banner "PHASE 2: HTTPX"
+    
+    if [ ! -s subdomains.txt ]; then
+        log WARN "subdomains.txt vide"
+        echo "$TARGET" > subdomains.txt
+    fi
+    
+    local cmd="cat subdomains.txt | httpx -silent -mc 200,301,302,403,401 -timeout 5 -rate-limit $HTTPX_RATE -o live-raw.txt"
+    [ -n "$PROXY" ] && cmd="$cmd -http-proxy $PROXY"
+    
+    if eval "$cmd"; then
+        local count=$(wc -l < live-raw.txt)
+        log OK "HTTPX: $count hotes actifs"
+        parse_urls "live-raw.txt" "live.txt"
+        log_timing "HTTPX"
+        return 0
+    else
+        log ERR "HTTPX echoue"
+        return 1
+    fi
+}
 
-cat << EOF > RAPPORT-BUGBOUNTY.txt
-Recon $TARGET - $(date)
+parse_urls() {
+    local input="$1"
+    local output="$2"
+    
+    if command -v jq &>/dev/null && file "$input" | grep -q "JSON"; then
+        jq -r '.url // .URL // .' "$input" 2>/dev/null > "$output" || \
+        grep -oP 'https?://[^\s\[\]"]+' "$input" > "$output"
+    else
+        sed -E 's/^\[//;s/\]$//;s/^https?:\/\///;s/^/http:\/\//' "$input" | \
+        grep -oP 'https?://[^\s]+' > "$output"
+    fi
+}
 
-FICHIERS GÉNÉRÉS :
+# Katana - Web crawling
+run_katana() {
+    log_banner "PHASE 3: KATANA"
+    
+    if [ ! -s live.txt ]; then
+        log WARN "live.txt vide"
+        touch urls.txt
+        return 0
+    fi
+    
+    local cmd="timeout $TIMEOUT_KATANA cat live.txt | katana -silent -depth 2 -timeout 5"
+    [ -n "$PROXY" ] && cmd="$cmd -proxy $PROXY"
+    cmd="$cmd -o urls.txt"
+    
+    if eval "$cmd" 2>/dev/null || true; then
+        local count=$(wc -l < urls.txt)
+        if [ "$count" -gt 0 ]; then
+            log OK "Katana: $count URLs"
+        else
+            log WARN "Katana: aucun resultat"
+        fi
+        log_timing "Katana"
+        return 0
+    else
+        log WARN "Katana timeout"
+        return 0
+    fi
+}
 
-subdomains.txt          - Tous sous-domaines
-live.txt               - Pages web actives (200/3xx/403)  
-urls.txt               - URLs crawlées
-nuclei-secrets.txt     - Secrets exposés (API keys)
-nuclei-cve.txt         - CVE medium+
-takeover.txt           - Subdomain takeover
-gf-xss.txt             - Params XSS
-gf-lfi.txt             - Params LFI
-gf-sqli.txt            - Params SQLi
-bxss-results.txt       - Tests XSS auto
-ferox.txt              - Directory bruteforce
+# Nuclei - Detection vulnerabilites et secrets
+run_nuclei() {
+    log_banner "PHASE 4: NUCLEI"
+    
+    if [ ! -s live.txt ]; then
+        log WARN "live.txt vide"
+        touch nuclei-cve.json nuclei-secrets.json
+        return 0
+    fi
+    
+    log INFO "Scan CVE..."
+    local cmd="cat live.txt | timeout 600 nuclei -rate-limit $NUCLEI_RATE -severity medium,high,critical -json -silent"
+    [ -n "$PROXY" ] && cmd="$cmd -proxy $PROXY"
+    cmd="$cmd -o nuclei-cve.json"
+    
+    if eval "$cmd" 2>/dev/null || true; then
+        local count=$(wc -l < nuclei-cve.json)
+        log OK "CVE detectes: $count"
+    else
+        log WARN "Nuclei CVE timeout"
+    fi
+    
+    log INFO "Scan secrets..."
+    cmd="cat live.txt | timeout 300 nuclei -rate-limit $NUCLEI_RATE -tags exposure,secret,creds -json -silent"
+    [ -n "$PROXY" ] && cmd="$cmd -proxy $PROXY"
+    cmd="$cmd -o nuclei-secrets.json"
+    
+    if eval "$cmd" 2>/dev/null || true; then
+        local count=$(wc -l < nuclei-secrets.json)
+        log OK "Secrets detectes: $count"
+    else
+        log WARN "Nuclei secrets timeout"
+    fi
+    
+    log_timing "Nuclei"
+}
 
-PRIORITÉ : nuclei-secrets.txt > takeover.txt > gf-xss.txt
+# Subzy - Detection takeover sous-domaines
+run_subzy() {
+    log_banner "PHASE 5: SUBZY"
+    
+    if [ ! -s subdomains.txt ]; then
+        log WARN "subdomains.txt vide"
+        touch takeover.txt
+        return 0
+    fi
+    
+    if timeout $TIMEOUT_FEROX subzy run --targets subdomains.txt -o takeover.json 2>/dev/null || true; then
+        local count=$(wc -l < takeover.json)
+        if [ "$count" -gt 0 ]; then
+            jq -r '.vulnerable // empty' takeover.json > takeover.txt 2>/dev/null || true
+            count=$(wc -l < takeover.txt)
+            log OK "Takeovers detectes: $count"
+        else
+            log INFO "Aucun takeover"
+            touch takeover.txt
+        fi
+    else
+        log WARN "Subzy timeout"
+        touch takeover.txt
+    fi
+    
+    log_timing "Subzy"
+}
+
+# GF - Pattern matching sur URLs
+run_gf() {
+    log_banner "PHASE 6: GF PATTERNS"
+    
+    if [ ! -s urls.txt ]; then
+        log WARN "urls.txt vide"
+        touch gf-xss.txt gf-lfi.txt gf-sqli.txt gf-ssti.txt
+        return 0
+    fi
+    
+    if ! gf -list 2>/dev/null | grep -q xss; then
+        log WARN "Patterns GF manquants"
+        touch gf-xss.txt gf-lfi.txt gf-sqli.txt gf-ssti.txt
+        return 0
+    fi
+    
+    local patterns=("xss" "lfi" "sqli" "ssti")
+    for pattern in "${patterns[@]}"; do
+        if cat urls.txt | gf "$pattern" > "gf-${pattern}.txt" 2>/dev/null || true; then
+            local count=$(wc -l < "gf-${pattern}.txt")
+            log OK "GF $pattern: $count params"
+        else
+            touch "gf-${pattern}.txt"
+        fi
+    done
+    
+    log_timing "GF"
+}
+
+# FFUF - Fuzzing XSS avec payloads
+run_ffuf_xss() {
+    log_banner "PHASE 7: FFUF XSS"
+    
+    if [ ! -s gf-xss.txt ] || [ ! -s "$1" ]; then
+        log WARN "Pas de params XSS ou wordlist absente"
+        touch ffuf-xss.json
+        return 0
+    fi
+    
+    local xss_wordlist="$1"
+    
+    if timeout $TIMEOUT_FFUF cat gf-xss.txt | \
+        ffuf -u FUZZ -w "$xss_wordlist" -mc 200,403 -rate "$FFUF_RATE" \
+        -json -o ffuf-xss.json 2>/dev/null || true; then
+        
+        local count=$(wc -l < ffuf-xss.json)
+        log OK "FFUF results: $count"
+    else
+        log WARN "FFUF timeout"
+        touch ffuf-xss.json
+    fi
+    
+    log_timing "FFUF"
+}
+
+# Feroxbuster - Directory fuzzing
+run_feroxbuster() {
+    log_banner "PHASE 8: FEROXBUSTER"
+    
+    if [ ! -s live.txt ]; then
+        log WARN "live.txt vide"
+        touch ferox.txt
+        return 0
+    fi
+    
+    local wordlist="$1"
+    
+    if timeout $TIMEOUT_FEROX cat live.txt | \
+        feroxbuster --stdin -w "$wordlist" -x js,html,php,txt,json \
+        --rate-limit $FFUF_RATE -o ferox.txt 2>/dev/null || true; then
+        
+        local count=$(wc -l < ferox.txt)
+        if [ "$count" -gt 0 ]; then
+            log OK "Feroxbuster: $count endpoints"
+        else
+            log INFO "Aucun endpoint"
+        fi
+    else
+        log WARN "Feroxbuster timeout"
+    fi
+    
+    log_timing "Feroxbuster"
+}
+
+run_parallel_phase_1() {
+    log_banner "ENUMERATION (parallele)"
+    
+    run_subfinder &
+    local pid_subfinder=$!
+    
+    wait $pid_subfinder
+    
+    if [ -s subdomains.txt ]; then
+        run_httpx &
+        wait $!
+    fi
+}
+
+run_parallel_phase_2() {
+    log_banner "CRAWLING ET ANALYSE (parallele)"
+    
+    run_katana &
+    local pid_katana=$!
+    
+    run_nuclei "$1" &
+    local pid_nuclei=$!
+    
+    run_subzy &
+    local pid_subzy=$!
+    
+    wait $pid_katana $pid_nuclei $pid_subzy
+}
+
+run_parallel_phase_3() {
+    log_banner "FUZZING (parallele)"
+    
+    run_gf &
+    local pid_gf=$!
+    
+    run_ffuf_xss "$1" &
+    local pid_ffuf=$!
+    
+    run_feroxbuster "$2" &
+    local pid_ferox=$!
+    
+    wait $pid_gf $pid_ffuf $pid_ferox
+}
+
+generate_report() {
+    log_banner "GENERATION RAPPORT"
+    
+    local report_file="RAPPORT-BUGBOUNTY.txt"
+    
+    cat > "$report_file" << EOF
+================================================================================
+                      BUG BOUNTY RECON REPORT
+================================================================================
+
+Cible: $TARGET
+Date: $(date '+%Y-%m-%d %H:%M:%S')
+
+================================================================================
+RESULTATS NUMERIQUES
+================================================================================
+
+Enumeration:
+  Sous-domaines:       $([ -s subdomains.txt ] && wc -l < subdomains.txt || echo "0")
+  Hotes actifs:        $([ -s live.txt ] && wc -l < live.txt || echo "0")
+  URLs crawlees:       $([ -s urls.txt ] && wc -l < urls.txt || echo "0")
+
+Securite:
+  CVE/Vulnerabilites:  $([ -s nuclei-cve.json ] && wc -l < nuclei-cve.json || echo "0")
+  Secrets/Expositions: $([ -s nuclei-secrets.json ] && wc -l < nuclei-secrets.json || echo "0")
+  Takeovers:           $([ -s takeover.txt ] && wc -l < takeover.txt || echo "0")
+
+Parametres:
+  XSS potentiels:      $([ -s gf-xss.txt ] && wc -l < gf-xss.txt || echo "0")
+  LFI potentiels:      $([ -s gf-lfi.txt ] && wc -l < gf-lfi.txt || echo "0")
+  SQLi potentiels:     $([ -s gf-sqli.txt ] && wc -l < gf-sqli.txt || echo "0")
+  SSTI potentiels:     $([ -s gf-ssti.txt ] && wc -l < gf-ssti.txt || echo "0")
+
+Fuzzing:
+  FFUF XSS results:    $([ -s ffuf-xss.json ] && wc -l < ffuf-xss.json || echo "0")
+  Repertoires:         $([ -s ferox.txt ] && wc -l < ferox.txt || echo "0")
+
+================================================================================
+CRITIQUES A VERIFIER
+================================================================================
+
 EOF
+
+    if [ -s takeover.txt ] && [ "$(wc -l < takeover.txt)" -gt 0 ]; then
+        echo "TAKEOVERS DETECTES:" >> "$report_file"
+        cat takeover.txt | head -10 >> "$report_file"
+        echo "" >> "$report_file"
+    fi
+    
+    if [ -s nuclei-secrets.json ] && [ "$(wc -l < nuclei-secrets.json)" -gt 0 ]; then
+        echo "SECRETS/EXPOSITIONS:" >> "$report_file"
+        jq -r '.extracted // .template // empty' nuclei-secrets.json 2>/dev/null | head -10 >> "$report_file"
+        echo "" >> "$report_file"
+    fi
+    
+    if [ -s nuclei-cve.json ] && [ "$(wc -l < nuclei-cve.json)" -gt 0 ]; then
+        echo "CVE CRITIQUES:" >> "$report_file"
+        jq -r 'select(.severity=="critical") | .template_name' nuclei-cve.json 2>/dev/null | head -10 >> "$report_file"
+        echo "" >> "$report_file"
+    fi
+    
+    cat >> "$report_file" << EOF
+
+================================================================================
+FICHIERS GENERES
+================================================================================
+
+Enumeration:
+  subdomains.txt       - Tous les sous-domaines
+  live.txt             - Hotes actifs (HTTP 200/301/302/403)
+  urls.txt             - URLs crawlees
+
+Securite:
+  nuclei-cve.json      - CVE et vulnerabilites detectes
+  nuclei-secrets.json  - Secrets et expositions
+  takeover.json        - Resultats Subzy
+  takeover.txt         - Takeovers confirmes
+
+Parametres:
+  gf-xss.txt           - Params XSS potentiels
+  gf-lfi.txt           - Params LFI potentiels
+  gf-sqli.txt          - Params SQLi potentiels
+  gf-ssti.txt          - Params SSTI potentiels
+
+Fuzzing:
+  ffuf-xss.json        - Resultats FFUF XSS
+  ferox.txt            - Repertoires et fichiers decouvert
+
+Logs:
+  execution.log        - Logs d'execution detailles
+  RAPPORT-BUGBOUNTY.txt - Ce rapport
+
+================================================================================
+EOF
+
+    log OK "Rapport genere"
+}
+
+main() {
+    local START_TIME=$(date +%s)
+    
+    clear
+    printf "================================================================================\n"
+    printf "Bug Bounty Automator v2.2 - PRODUCTION\n"
+    printf "================================================================================\n\n"
+    
+    log INFO "Repertoire: $(pwd)"
+    
+    validate_input
+    check_connectivity
+    check_tools
+    local ferox_wordlist=$(check_wordlists)
+    local templates_path=$(setup_nuclei)
+    
+    log_banner "CONFIGURATION WORDLIST XSS"
+    echo ""
+    echo "  [1] SecLists XSS (Jhaddix)"
+    echo "  [2] Personnalise (chemin)"
+    echo "  [3] Skip FFUF"
+    echo ""
+    read -p "Choix (1-3): " xss_choice
+    
+    local xss_wordlist=""
+    case "$xss_choice" in
+        1)
+            xss_wordlist="/usr/share/seclists/Fuzzing/XSS/XSS-Jhaddix.txt"
+            if [ ! -f "$xss_wordlist" ]; then
+                log WARN "Wordlist manquante"
+                sudo apt update && sudo apt install -y seclists 2>/dev/null || \
+                    log WARN "Installation echouee"
+            fi
+            ;;
+        2)
+            read -p "Chemin: " xss_wordlist
+            [ ! -f "$xss_wordlist" ] && { log WARN "Fichier absent"; xss_wordlist=""; }
+            ;;
+        *)
+            log WARN "FFUF skip"
+            ;;
+    esac
+    
+    if [ -n "$xss_wordlist" ]; then
+        log OK "Wordlist XSS selectionnee"
+    fi
+    
+    log_banner "EXECUTION"
+    
+    run_parallel_phase_1
+    run_parallel_phase_2 "$templates_path"
+    
+    if [ -n "$xss_wordlist" ] && [ -f "$xss_wordlist" ]; then
+        run_parallel_phase_3 "$xss_wordlist" "$ferox_wordlist"
+    else
+        run_gf &
+        local pid_gf=$!
+        run_feroxbuster "$ferox_wordlist" &
+        local pid_ferox=$!
+        wait $pid_gf $pid_ferox
+        touch ffuf-xss.json
+    fi
+    
+    generate_report
+    
+    local TOTAL_TIME=$(( $(date +%s) - START_TIME ))
+    
+    log_banner "COMPLETION"
+    log OK "Repertoire: $(pwd)"
+    log OK "Fichiers: $(ls -1 | wc -l)"
+    log OK "Taille: $(du -sh . | cut -f1)"
+    log OK "Temps total: ${TOTAL_TIME}s"
+    
+    printf "\n"
+    log OK "Archive: ../${OUTPUT_DIR}.tar.gz"
+    log OK "Rapport: RAPPORT-BUGBOUNTY.txt"
+}
+
+main "$@"
