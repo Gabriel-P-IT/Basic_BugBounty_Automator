@@ -438,7 +438,7 @@ run_ffuf_xss() {
 # Feroxbuster - Directory fuzzing
 run_feroxbuster() {
     log_banner "PHASE 8: FEROXBUSTER"
-    
+    TIMEOUT_FEROX=${TIMEOUT_FEROX:-300}
     if [ ! -s live.txt ]; then
         log WARN "live.txt vide"
         touch ferox.txt
