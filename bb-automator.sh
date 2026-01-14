@@ -419,19 +419,22 @@ run_feroxbuster() {
     if timeout $TIMEOUT_FEROX cat live.txt | \
         feroxbuster --stdin -w "$wordlist" -x js,html,php,txt,json \
         --rate-limit $FFUF_RATE -o ferox.txt 2>/dev/null || true; then
+        [ -f ferox.txt ] || touch ferox.txt
         
-        local count=$(wc -l < ferox.txt)
+        local count=$(wc -l < ferox.txt 2>/dev/null || echo 0)
         if [ "$count" -gt 0 ]; then
             log OK "Feroxbuster: $count endpoints"
         else
-            log INFO "Aucun endpoint"
+            log INFO "Aucun endpoint trouvé"
         fi
     else
         log WARN "Feroxbuster timeout"
+        touch ferox.txt 
     fi
     
     log_timing "Feroxbuster"
 }
+
 
 run_parallel_phase_1() {
     log_banner "ENUMERATION (parallele)"
