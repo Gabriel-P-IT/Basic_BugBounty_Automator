@@ -31,7 +31,7 @@ Script qui exécute une **reconnaissance complète** d'une cible en une seule co
 7️⃣ GF PATTERNS → Params XSS/LFI/SQLi/SSTI
 8️⃣ FUZZING     → XSS + Directory brute-force
 ↓
-📄 RAPPORT + archive.tar.gz
+RAPPORT + archive.tar.gz
 ```
 
 ---
