@@ -191,6 +191,14 @@ setup_nuclei() {
 run_subfinder() {
     log_banner "PHASE 1: SUBFINDER"
     
+    # LOCALHOST: Skip subfinder
+    if [[ "$TARGET" =~ ^(localhost|127\.0\.0\.1)(:[0-9]+)?$ ]]; then
+        log INFO "Localhost → Subfinder skip (pas de DNS public)"
+        echo "$TARGET" > subdomains.txt
+        log OK "Subfinder: localhost forcé"
+        return 0
+    fi
+    
     local cmd="subfinder -d $TARGET -silent"
     [ -n "$PROXY" ] && cmd="$cmd -proxy $PROXY"
     
@@ -201,14 +209,17 @@ run_subfinder() {
             log_timing "Subfinder"
             return 0
         else
-            log WARN "Subfinder: aucun resultat"
-            return 1
+            log WARN "Subfinder: aucun resultat → fallback $TARGET"
+            echo "$TARGET" > subdomains.txt
+            return 0 
         fi
     else
-        log ERR "Subfinder echoue"
-        return 1
+        log WARN "Subfinder échoué → fallback $TARGET"
+        echo "$TARGET" > subdomains.txt
+        return 0
     fi
 }
+
 
 # HTTPX - Validation HTTP et resolution
 run_httpx() {
@@ -361,24 +372,33 @@ run_gf() {
         return 0
     fi
     
-    if ! gf -list 2>/dev/null | grep -q xss; then
-        log WARN "Patterns GF manquants"
-        touch gf-xss.txt gf-lfi.txt gf-sqli.txt gf-ssti.txt
-        return 0
-    fi
+    # FORCE : Skip vérif patterns, utilise fallback
+    log INFO "GF force sans vérif patterns"
     
     local patterns=("xss" "lfi" "sqli" "ssti")
     for pattern in "${patterns[@]}"; do
-        if cat urls.txt | gf "$pattern" > "gf-${pattern}.txt" 2>/dev/null || true; then
-            local count=$(wc -l < "gf-${pattern}.txt")
-            log OK "GF $pattern: $count params"
-        else
-            touch "gf-${pattern}.txt"
-        fi
+        case "$pattern" in
+            xss)
+                grep -E '(\?|&)(p|a|k|id|q|search|redirect|next|path)=' urls.txt > "gf-${pattern}.txt" 2>/dev/null || touch "gf-${pattern}.txt"
+                ;;
+            lfi)
+                grep -E '(\?|&)(file|path|page|load|template)=' urls.txt > "gf-${pattern}.txt" 2>/dev/null || touch "gf-${pattern}.txt"
+                ;;
+            sqli)
+                grep -E '(\?|&)(id|user|uid)=[0-9]' urls.txt > "gf-${pattern}.txt" 2>/dev/null || touch "gf-${pattern}.txt"
+                ;;
+            ssti)
+                grep -E '{{|{%|<\${|#{|<\?' urls.txt > "gf-${pattern}.txt" 2>/dev/null || touch "gf-${pattern}.txt"
+                ;;
+        esac
+        
+        local count=$(wc -l < "gf-${pattern}.txt" 2>/dev/null || echo 0)
+        log OK "GF $pattern: $count params (force)"
     done
     
     log_timing "GF"
 }
+
 
 # FFUF - Fuzzing XSS avec payloads
 run_ffuf_xss() {
