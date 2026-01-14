@@ -11,8 +11,10 @@ Script qui exécute une **reconnaissance complète** d'une cible en une seule co
 
 ## 🚀 Usage Simple
 ```bash
-./bb-automator.sh hackthebox.com
-./bb-automator.sh uber.com "http://127.0.0.1:8080"
+./bb-automator.sh hackthebox.com                    # Scan standard
+./bb-automator.sh 127.0.0.1:8080                    # Local vuln (Juice Shop)
+./bb-automator.sh uber.com "http://burp:8080"       # Via Burp proxy
+./bb-automator.sh target.com "" 3                   # Skip FFUF (rapide)
 ```
 
 **Durée** : 20-45 minutes selon la taille de la cible
@@ -67,13 +69,9 @@ httpx katana nuclei subzy gf ffuf feroxbuster seclists jq
 
 Bientôt un script d'installation de tous ces outils sera mis en place ;)
 
----
-
-## 🎨 Fonctionnalités
-- ✅ **Parallélisation** des phases (x3 plus rapide)
-- ✅ **Support proxy** Burp Suite/ZAP
-- ✅ **Logging coloré** avec timestamps
-- ✅ **Rapport priorisé** (critiques en 1er)
-- ✅ **Archive automatique** .tar.gz
-- ✅ **Gestion d'erreurs** robuste
-
+```bash
+gf -save xss-quick -Hnri '(?i)(id|q|search|redirect)=[^&"'\''/]{1,}'
+gf -save sqli-quick -Hnri '(?i)(id|user|uid)=[0-9]'
+gf -save lfi-quick -Hnri '(?i)(file|path|template)=(\.\.|\/etc)'
+gf -list  # 3 patterns basiques mettez ce que vous souhaitez
+```
