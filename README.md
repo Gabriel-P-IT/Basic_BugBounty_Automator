@@ -58,20 +58,3 @@ bb-domain-YYYYMMDD_HHMMSS/
 └── archive.tar.gz           # Tout compressé
 ```
 
----
-
-
-
-## ⚙️ Prérequis (Tools)
-```bash
-httpx katana nuclei subzy gf ffuf feroxbuster seclists jq
-```
-
-Bientôt un script d'installation de tous ces outils sera mis en place ;)
-
-```bash
-gf -save xss-quick -Hnri '(?i)(id|q|search|redirect)=[^&"'\''/]{1,}'
-gf -save sqli-quick -Hnri '(?i)(id|user|uid)=[0-9]'
-gf -save lfi-quick -Hnri '(?i)(file|path|template)=(\.\.|\/etc)'
-gf -list  # 3 patterns basiques mettez ce que vous souhaitez
-```
