@@ -11,10 +11,10 @@ Script qui exécute une **reconnaissance complète** d'une cible en une seule co
 
 ## 🚀 Usage Simple
 ```bash
-./bb-automator.sh hackthebox.com                    # Scan standard
+./bb-automator.sh example.com                    # Scan standard
 ./bb-automator.sh 127.0.0.1:8080                    # Local vuln (Juice Shop)
-./bb-automator.sh uber.com "http://burp:8080"       # Via Burp proxy
-./bb-automator.sh target.com "" 3                   # Skip FFUF (rapide)
+./bb-automator.sh example.com "http://burp:8080"       # Via Burp proxy
+./bb-automator.sh example.com "" 3                   # Skip FFUF (rapide)
 ```
 
 **Durée** : 20-45 minutes selon la taille de la cible
