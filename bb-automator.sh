@@ -1,17 +1,35 @@
 #!/bin/bash
 
 ################################################################################
-# Bug Bounty Automator v2.3
+# Bug Bounty Automator v2.3 - PATCHED
+#
+# Fixes:
+# 1. OUTPUT_DIR avec TARGET_SAFE (élimine https:// et caractères spéciaux)
+# 2. Subfinder: feature-detect -providers + double -o supprimé
+# 3. Stdout clean: redirection >/dev/null 2>&1 sur les tools
+# 4. Katana: -fs fqdn pour limiter au FQDN (pas root domain)
+# 5. Nuclei: sortie supprimée du stdout (reste seulement -o)
 #
 # Usage: ./bb-automator.sh example.com [proxy_url]
 ################################################################################
 
 set -euo pipefail
 
-TARGET="${1:?Erreur: target requis}"
+# ═══════════════════════════════════════════════════════════════════════════
+# NORMALISATION CIBLE + SETUP DIRS
+# ═══════════════════════════════════════════════════════════════════════════
+
+RAW_TARGET="${1:?Erreur: target requis}"
 PROXY="${2:-}"
+
+# Normaliser la cible (retire scheme/www/trailing slash)
+TARGET="$(echo "$RAW_TARGET" | sed 's|^https\?://||;s|^www\.||;s|/$||')"
+
+# Pour les noms de dossiers/fichiers uniquement (pas de :/ dans le path)
+TARGET_SAFE="$(echo "$TARGET" | tr '/:' '__')"
+
 TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
-OUTPUT_DIR="bb-${TARGET}-${TIMESTAMP}"
+OUTPUT_DIR="bb-${TARGET_SAFE}-${TIMESTAMP}"
 BASE_DIR="$(pwd)"
 
 mkdir -p "$OUTPUT_DIR"
@@ -40,6 +58,10 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FONCTIONS LOGGING
+# ═══════════════════════════════════════════════════════════════════════════
 
 log() {
     local level="$1"
@@ -114,6 +136,10 @@ choose_gf_mode() {
     log OK "GF_MODE=${GF_MODE}"
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PRE-EXECUTION: VALIDATION + CHECKS
+# ═══════════════════════════════════════════════════════════════════════════
+
 validate_input() {
     log_banner "VALIDATION ENTREES"
 
@@ -122,7 +148,6 @@ validate_input() {
         return 0
     fi
 
-    TARGET=$(echo "$TARGET" | sed 's|^https\?://||;s|^www\.||;s|/$||')
     log INFO "Cible: $TARGET"
 
     if ! [[ "$TARGET" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
@@ -211,8 +236,10 @@ setup_nuclei() {
     echo ""
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 1: ENUMERATION SOUS-DOMAINES (SUBFINDER)
+# ═══════════════════════════════════════════════════════════════════════════
 
-# Subfinder - Enumeration sous-domaines
 run_subfinder() {
     log_banner "PHASE 1: SUBFINDER"
 
@@ -220,17 +247,20 @@ run_subfinder() {
         log INFO "Localhost -> Subfinder skip"
         echo "$TARGET" > subdomains.txt
         log OK "Subfinder: localhost force"
+        log_timing "Subfinder"
         return 0
     fi
 
-    local cmd
-    cmd="subfinder -d $TARGET -all -silent -t 100"
-    if [ -n "${SUBFINDER_PROVIDERS:-}" ]; then
-        cmd="$cmd -providers $SUBFINDER_PROVIDERS"
+    # FIX #2: Feature-detect -providers flag
+    local cmd="subfinder -d \"$TARGET\" -all -silent -t 100 -o subdomains.txt"
+    
+    if subfinder -h 2>&1 | grep -q -- '-providers'; then
+        cmd="subfinder -d \"$TARGET\" -all -silent -t 100 -providers \"$SUBFINDER_PROVIDERS\" -o subdomains.txt"
     fi
+
     [ -n "$PROXY" ] && cmd="$cmd -proxy $PROXY"
 
-    if eval "$cmd -o subdomains.txt" 2>/dev/null; then
+    if eval "$cmd 2>/dev/null"; then
         local count
         count=$(wc -l < subdomains.txt 2>/dev/null || echo 0)
         if [ "$count" -gt 0 ]; then
@@ -245,7 +275,10 @@ run_subfinder() {
     log_timing "Subfinder"
 }
 
-# HTTPX - Validation HTTP
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 2: VALIDATION HTTP (HTTPX)
+# ═══════════════════════════════════════════════════════════════════════════
+
 run_httpx() {
     log_banner "PHASE 2: HTTPX"
 
@@ -255,11 +288,15 @@ run_httpx() {
     cmd="cat subdomains.txt | httpx -silent -mc 200,301,302 -timeout 5 -rate-limit $HTTPX_RATE -o live-raw.txt"
     [ -n "$PROXY" ] && cmd="$cmd -http-proxy $PROXY"
 
-    eval "$cmd" || die "HTTPX echoue"
-
-    local count
-    count=$(wc -l < live-raw.txt 2>/dev/null || echo 0)
-    log OK "HTTPX: $count hotes actifs"
+    # FIX #3: Redirect stdout to suppress httpx output
+    if eval "$cmd >/dev/null 2>&1"; then
+        local count
+        count=$(wc -l < live-raw.txt 2>/dev/null || echo 0)
+        log OK "HTTPX: $count hotes actifs"
+    else
+        log WARN "HTTPX echoue partiellement"
+        : > live-raw.txt
+    fi
 
     parse_urls "live-raw.txt" "live.txt"
     log_timing "HTTPX"
@@ -282,7 +319,10 @@ parse_urls() {
     log INFO "Parse: $count URLs -> $output"
 }
 
-# Katana - Web crawling
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 3: WEB CRAWLING (KATANA)
+# ═══════════════════════════════════════════════════════════════════════════
+
 run_katana() {
     log_banner "PHASE 3: KATANA"
 
@@ -293,18 +333,27 @@ run_katana() {
     fi
 
     local cmd
-    cmd="timeout $TIMEOUT_KATANA cat live.txt | katana -silent -depth 3 -timeout 10 -c 50 -rl 100 -js-crawl -o urls.txt"
-    [ -n "$PROXY" ] && cmd="timeout $TIMEOUT_KATANA cat live.txt | katana -silent -depth 3 -timeout 10 -c 50 -rl 100 -js-crawl -proxy $PROXY -o urls.txt"
+    # FIX #4: Limiter au FQDN avec -fs fqdn (pas root domain)
+    cmd="timeout $TIMEOUT_KATANA cat live.txt | katana -silent -depth 3 -timeout 10 -c 50 -rl 100 -js-crawl -fs fqdn -o urls.txt"
+    [ -n "$PROXY" ] && cmd="timeout $TIMEOUT_KATANA cat live.txt | katana -silent -depth 3 -timeout 10 -c 50 -rl 100 -js-crawl -fs fqdn -proxy $PROXY -o urls.txt"
 
-    eval "$cmd" 2>/dev/null || true
+    # FIX #3: Suppress katana stdout
+    if eval "$cmd >/dev/null 2>&1"; then
+        local count
+        count=$(wc -l < urls.txt 2>/dev/null || echo 0)
+        log OK "Katana: $count URLs"
+    else
+        log WARN "Katana timeout ou erreur"
+        : > urls.txt
+    fi
 
-    local count
-    count=$(wc -l < urls.txt 2>/dev/null || echo 0)
-    log OK "Katana: $count URLs"
     log_timing "Katana"
 }
 
-# Nuclei - Scans
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 4: SCANS SECURITE (NUCLEI)
+# ═══════════════════════════════════════════════════════════════════════════
+
 run_nuclei() {
     log_banner "PHASE 4: NUCLEI"
 
@@ -320,19 +369,23 @@ run_nuclei() {
     log INFO "Scan CVE..."
     cmd="cat live.txt | timeout $TIMEOUT_NUCLEI_CVE nuclei -rate-limit $NUCLEI_RATE -severity medium,high,critical -silent -o nuclei-cve.txt"
     [ -n "$PROXY" ] && cmd="cat live.txt | timeout $TIMEOUT_NUCLEI_CVE nuclei -rate-limit $NUCLEI_RATE -severity medium,high,critical -proxy $PROXY -silent -o nuclei-cve.txt"
-    eval "$cmd" 2>/dev/null || true
+    # FIX #3 + #5: Suppress all nuclei stdout/stderr
+    eval "$cmd >/dev/null 2>&1" || true
 
     log INFO "Scan secrets..."
     cmd="cat live.txt | timeout $TIMEOUT_NUCLEI_SECRETS nuclei -rate-limit $NUCLEI_RATE -tags token,exposure,default-login -silent -o nuclei-secrets.txt"
     [ -n "$PROXY" ] && cmd="cat live.txt | timeout $TIMEOUT_NUCLEI_SECRETS nuclei -rate-limit $NUCLEI_RATE -tags token,exposure,default-login -proxy $PROXY -silent -o nuclei-secrets.txt"
-    eval "$cmd" 2>/dev/null || true
+    eval "$cmd >/dev/null 2>&1" || true
 
     log OK "Nuclei CVE: $(wc -l < nuclei-cve.txt 2>/dev/null || echo 0)"
     log OK "Nuclei secrets: $(wc -l < nuclei-secrets.txt 2>/dev/null || echo 0)"
     log_timing "Nuclei"
 }
 
-# Subzy - Takeover
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 5: SUBDOMAIN TAKEOVER (SUBZY)
+# ═══════════════════════════════════════════════════════════════════════════
+
 run_subzy() {
     log_banner "PHASE 5: SUBZY"
 
@@ -342,7 +395,8 @@ run_subzy() {
         return 0
     fi
 
-    timeout "$TIMEOUT_SUBZY" subzy check -l subdomains.txt -o takeover.json 2>/dev/null || true
+    # FIX #3: Suppress subzy stdout
+    timeout "$TIMEOUT_SUBZY" subzy check -l subdomains.txt -o takeover.json >/dev/null 2>&1 || true
 
     if [ -s takeover.json ]; then
         jq -r '.. | objects | select(has(\"vulnerable\") and .vulnerable==true) | .domain? // empty' takeover.json 2>/dev/null \
@@ -355,7 +409,10 @@ run_subzy() {
     log_timing "Subzy"
 }
 
-# GF - Pattern matching (default/custom/skip)
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 6: PATTERN MATCHING (GF)
+# ═══════════════════════════════════════════════════════════════════════════
+
 run_gf() {
     log_banner "PHASE 6: GF PATTERNS"
 
@@ -403,13 +460,16 @@ run_gf() {
     log_timing "GF"
 }
 
-# FFUF - XSS fuzzing
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 7: FUZZING XSS (FFUF)
+# ═══════════════════════════════════════════════════════════════════════════
+
 run_ffuf_xss() {
     log_banner "PHASE 7: FFUF XSS"
 
     local xss_wordlist="$1"
 
-    if [ ! -s gf-xss.txt ] || [ ! -s "$xss_wordlist" ]; then
+    if [ ! -s gf-xss.txt ] || [ -z "$xss_wordlist" ] || [ ! -f "$xss_wordlist" ]; then
         log WARN "FFUF XSS skip"
         : > ffuf-xss.json
         : > ffuf-xss.txt
@@ -423,12 +483,12 @@ run_ffuf_xss() {
             local base="${url%\?*}"
             local fuzz_url="${base}?${param}=FUZZ"
 
+            # FIX #3: Suppress ffuf stdout
             timeout 60 ffuf -u "$fuzz_url" -w "$xss_wordlist" \
                 -mc 200,301,302,403 -rate "$FFUF_RATE" \
-                -o "ffuf-${count}.json" 2>/dev/null || true
+                -o "ffuf-${count}.json" >/dev/null 2>&1 || true
 
             ((count++))
-            log INFO "FFUF XSS: ${count} requetes lancees"
         fi
     done < gf-xss.txt
 
@@ -437,7 +497,10 @@ run_ffuf_xss() {
     log_timing "FFUF"
 }
 
-# Feroxbuster - Dir fuzzing
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 8: FUZZING REPERTOIRES (FEROXBUSTER)
+# ═══════════════════════════════════════════════════════════════════════════
+
 run_feroxbuster() {
     log_banner "PHASE 8: FEROXBUSTER"
 
@@ -449,14 +512,25 @@ run_feroxbuster() {
 
     local wordlist="$1"
 
+    if [ ! -f "$wordlist" ]; then
+        log WARN "Wordlist introuvable: $wordlist"
+        : > ferox.txt
+        return 0
+    fi
+
+    # FIX #3: Suppress feroxbuster stdout
     timeout "$TIMEOUT_FEROX" cat live.txt | \
         feroxbuster --stdin -w "$wordlist" -x js,html,php,txt,json \
-        --rate-limit "$FFUF_RATE" -o ferox.txt 2>/dev/null || true
+        --rate-limit "$FFUF_RATE" -o ferox.txt >/dev/null 2>&1 || true
 
     [ -f ferox.txt ] || : > ferox.txt
     log OK "Feroxbuster: $(wc -l < ferox.txt 2>/dev/null || echo 0)"
     log_timing "Feroxbuster"
 }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EXECUTION PARALLELE
+# ═══════════════════════════════════════════════════════════════════════════
 
 run_parallel_phase_1() {
     log_banner "ENUMERATION (parallele)"
@@ -473,7 +547,7 @@ run_parallel_phase_2() {
     run_katana &
     local pid_katana=$!
 
-    run_nuclei "$1" &
+    run_nuclei &
     local pid_nuclei=$!
 
     run_subzy &
@@ -483,18 +557,25 @@ run_parallel_phase_2() {
 }
 
 run_parallel_phase_3() {
+    local xss_wordlist="$1"
+    local ferox_wordlist="$2"
+
     log_banner "FUZZING (parallele)"
     run_gf &
     local pid_gf=$!
 
-    run_ffuf_xss "$1" &
+    run_ffuf_xss "$xss_wordlist" &
     local pid_ffuf=$!
 
-    run_feroxbuster "$2" &
+    run_feroxbuster "$ferox_wordlist" &
     local pid_ferox=$!
 
     wait $pid_gf $pid_ffuf $pid_ferox
 }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RAPPORT FINAL
+# ═══════════════════════════════════════════════════════════════════════════
 
 generate_report() {
     log_banner "GENERATION RAPPORT"
@@ -508,6 +589,7 @@ generate_report() {
 
 Cible: $TARGET
 Date: $(date '+%Y-%m-%d %H:%M:%S')
+Repertoire: $OUTPUT_DIR
 
 ================================================================================
 RESULTATS NUMERIQUES
@@ -534,10 +616,33 @@ Fuzzing:
   Repertoires:         $([ -s ferox.txt ] && wc -l < ferox.txt || echo "0")
 
 ================================================================================
+FICHIERS GENERES
+================================================================================
+
+subdomains.txt           - Sous-domaines enumeres
+live.txt                 - URLs HTTP valides
+urls.txt                 - URLs crawlees (Katana)
+nuclei-cve.txt           - CVE/Vulnerabilites detectees
+nuclei-secrets.txt       - Secrets/expositions
+takeover.txt             - Takeover potentiels
+gf-xss.txt               - Parametres XSS suspects
+gf-lfi.txt               - Parametres LFI suspects
+gf-sqli.txt              - Parametres SQLi suspects
+gf-ssti.txt              - Parametres SSTI suspects
+ffuf-xss.json            - Resultats fuzzing XSS
+ferox.txt                - Repertoires decouvert
+
+execution.log            - Logs complets
+
+================================================================================
 EOF
 
     log OK "Rapport genere"
 }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════
 
 main() {
     local START_TIME
@@ -545,7 +650,7 @@ main() {
 
     clear
     printf "================================================================================\n"
-    printf "Bug Bounty Automator v2.3 - PRODUCTION\n"
+    printf "Bug Bounty Automator v2.3 - PATCHED\n"
     printf "================================================================================\n\n"
 
     log INFO "Repertoire: $(pwd)"
@@ -584,18 +689,8 @@ main() {
     log_banner "EXECUTION"
 
     run_parallel_phase_1
-    run_parallel_phase_2 "$templates_path"
-
-    if [ -n "$xss_wordlist" ]; then
-        run_parallel_phase_3 "$xss_wordlist" "$ferox_wordlist"
-    else
-        run_gf &
-        local pid_gf=$!
-        run_feroxbuster "$ferox_wordlist" &
-        local pid_ferox=$!
-        wait $pid_gf $pid_ferox
-        : > ffuf-xss.json
-    fi
+    run_parallel_phase_2
+    run_parallel_phase_3 "$xss_wordlist" "$ferox_wordlist"
 
     generate_report
 
