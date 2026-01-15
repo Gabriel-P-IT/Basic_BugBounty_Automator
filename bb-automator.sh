@@ -197,13 +197,20 @@ check_wordlists() {
 setup_nuclei() {
     log_banner "CONFIGURATION NUCLEI"
 
-    nuclei -update-templates >/dev/null 2>&1 || log WARN "Update templates echouee"
+    local templates_path="$HOME/nuclei-templates"
+    
+    nuclei -ut -ud "$templates_path" >/dev/null 2>&1 || log WARN "Update templates echouee"
+    
+    if [ -d "$templates_path" ]; then
+        log OK "Templates detectes: $templates_path"
+        echo "$templates_path"
+        return 0
+    fi
 
-    local templates_path="$HOME/.nuclei-templates"
-    [ -d "$templates_path" ] || die "Templates nuclei introuvables apres update"
-    log OK "Templates detectes"
-    echo "$templates_path"
+    log WARN "Templates nuclei introuvables (nuclei peut echouer ou etre incomplet)"
+    echo ""
 }
+
 
 # Subfinder - Enumeration sous-domaines
 run_subfinder() {
