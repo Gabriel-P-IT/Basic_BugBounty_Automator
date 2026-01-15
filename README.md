@@ -1,4 +1,4 @@
-# Bug Bounty Automator v2.2
+# Bug Bounty Automator v2.3
 ## Reconnaissance Automatisée Bug Bounty
 
 ### 🎯 Objectif
