@@ -16,7 +16,6 @@ Script qui exécute une **reconnaissance complète** d'une cible en une seule co
 ./bb-automator.sh example.com                    # Scan standard
 ./bb-automator.sh 127.0.0.1:8080                    # Local vuln (Juice Shop)
 ./bb-automator.sh example.com "http://burp:8080"       # Via Burp proxy
-./bb-automator.sh example.com "" 3                   # Skip FFUF (rapide)
 ```
 
 **Durée** : 20-45 minutes selon la taille de la cible
@@ -26,12 +25,12 @@ Script qui exécute une **reconnaissance complète** d'une cible en une seule co
 ## 📋 Workflow Automatisé (8 Phases)
 
 ```
-1️⃣ SUBFINDER    → 63 sous-domaines
-2️⃣ HTTPX       → 22 hôtes actifs  
-3️⃣ KATANA      → 200+ URLs crawlées
-4️⃣ NUCLEI CVE  → Vulnérabilités détectées
+1️⃣ SUBFINDER   → Detect sous-domaines
+2️⃣ HTTPX       → check hôtes actifs  
+3️⃣ KATANA      → crawls urls
+4️⃣ NUCLEI CVE  → CVE détectées
 5️⃣ NUCLEI SEC  → Secrets/API keys exposés
-6️⃣ SUBZY       → Takeover sous-domaines
+6️⃣ SUBZY       → Takeover sous-domaines possible 
 7️⃣ GF PATTERNS → Params XSS/LFI/SQLi/SSTI
 8️⃣ FUZZING     → XSS + Directory brute-force
 ↓
