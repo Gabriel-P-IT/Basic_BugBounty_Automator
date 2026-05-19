@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ################################################################################
-# Bug Bounty Automator v2.3 - PATCHED
+# Bug Bounty Automator v2.3 
 #
 # Fixes:
 # 1. OUTPUT_DIR avec TARGET_SAFE (élimine https:// et caractères spéciaux)
@@ -14,30 +14,79 @@
 ################################################################################
 
 set -euo pipefail
+ARCHIVE=true
+NON_INTERACTIVE=false
+NUCLEI_TEMPLATES_PATH=""
+
+
+
+usage() {
+    cat << EOF
+Usage: $(basename "$0") [OPTIONS] target [proxy_url]
+
+Options:
+  -h, --help           Affiche cette aide et quitte
+      --no-archive     Ne pas créer d'archive .tar.gz en fin de script
+      --non-interactive
+                       Ne pose aucune question (GF=default, FFUF XSS auto ou skip)
+
+Exemples:
+  $(basename "$0") example.com
+  $(basename "$0") --no-archive example.com http://127.0.0.1:8080
+EOF
+}
+
+parse_args() {
+    local args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --no-archive)
+                ARCHIVE=false
+                shift
+                ;;
+            --non-interactive)
+                NON_INTERACTIVE=true
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                echo "Option inconnue: $1" >&2
+                usage
+                exit 1
+                ;;
+            *)
+                # Première positionnelle rencontrée: target
+                break
+                ;;
+        esac
+    done
+
+    # Reste des arguments (target + proxy eventuel)
+    REMAINING_ARGS=("$@")
+}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # NORMALISATION CIBLE + SETUP DIRS
 # ═══════════════════════════════════════════════════════════════════════════
 
-RAW_TARGET="${1:?Erreur: target requis}"
-PROXY="${2:-}"
-
-# Normaliser la cible (retire scheme/www/trailing slash)
-TARGET="$(echo "$RAW_TARGET" | sed 's|^https\?://||;s|^www\.||;s|/$||')"
-
-# Pour les noms de dossiers/fichiers uniquement (pas de :/ dans le path)
-TARGET_SAFE="$(echo "$TARGET" | tr '/:' '__')"
-
-TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
-OUTPUT_DIR="bb-${TARGET_SAFE}-${TIMESTAMP}"
 BASE_DIR="$(pwd)"
-
-mkdir -p "$OUTPUT_DIR"
-cd "$OUTPUT_DIR"
-
-LOG_FILE="execution.log"
-: > "$LOG_FILE"
 PHASE_START_TIME=0
+LOG_FILE=""
+
+# Les variables suivantes seront définies dans main()
+RAW_TARGET=""
+PROXY=""
+TARGET=""
+TARGET_SAFE=""
+OUTPUT_DIR=""
 
 TIMEOUT_KATANA=600
 TIMEOUT_NUCLEI_CVE=600
@@ -106,19 +155,33 @@ die() {
 cleanup() {
     local exit_code=$?
     if [ $exit_code -eq 0 ]; then
-        log OK "Archivage en cours..."
-        cd "$BASE_DIR" 2>/dev/null || true
-        tar -czf "${OUTPUT_DIR}.tar.gz" "$OUTPUT_DIR" 2>/dev/null || true
-        cd "$OUTPUT_DIR" 2>/dev/null || true
-        log OK "Archive: ${BASE_DIR}/${OUTPUT_DIR}.tar.gz"
+        if [ "$ARCHIVE" = true ]; then
+            log OK "Archivage en cours..."
+            cd "$BASE_DIR" 2>/dev/null || true
+            if [ -n "$OUTPUT_DIR" ] && [ -d "$OUTPUT_DIR" ]; then
+                tar -czf "${OUTPUT_DIR}.tar.gz" "$OUTPUT_DIR" 2>/dev/null || true
+                log OK "Archive: ${BASE_DIR}/${OUTPUT_DIR}.tar.gz"
+            else
+                log WARN "Archivage: OUTPUT_DIR inexistant ou vide"
+            fi
+        else
+            log INFO "Archivage desactive (--no-archive)"
+        fi
     else
         log WARN "Script interrompu (code $exit_code)"
     fi
 }
+
 trap cleanup EXIT
 
 choose_gf_mode() {
     log_banner "CONFIGURATION GF"
+
+    if [ "$NON_INTERACTIVE" = true ]; then
+        GF_MODE="${GF_MODE:-default}"
+        log INFO "Mode non-interactif: GF_MODE=${GF_MODE}"
+        return 0
+    fi
 
     echo "  [1] Default (utilise tes patterns deja presents)"
     echo "  [2] Custom (cree/force patterns via gf -save)"
@@ -228,12 +291,11 @@ setup_nuclei() {
     
     if [ -d "$templates_path" ]; then
         log OK "Templates detectes: $templates_path"
-        echo "$templates_path"
-        return 0
+        NUCLEI_TEMPLATES_PATH="$templates_path"
+    else
+        log WARN "Templates nuclei introuvables (nuclei peut echouer ou etre incomplet)"
+        NUCLEI_TEMPLATES_PATH=""
     fi
-
-    log WARN "Templates nuclei introuvables (nuclei peut echouer ou etre incomplet)"
-    echo ""
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -364,17 +426,21 @@ run_nuclei() {
         return 0
     fi
 
+    local templates_flag=""
+    if [ -n "${NUCLEI_TEMPLATES_PATH:-}" ]; then
+        templates_flag="-t \"$NUCLEI_TEMPLATES_PATH\""
+    fi
+
     local cmd
 
     log INFO "Scan CVE..."
-    cmd="cat live.txt | timeout $TIMEOUT_NUCLEI_CVE nuclei -rate-limit $NUCLEI_RATE -severity medium,high,critical -silent -o nuclei-cve.txt"
-    [ -n "$PROXY" ] && cmd="cat live.txt | timeout $TIMEOUT_NUCLEI_CVE nuclei -rate-limit $NUCLEI_RATE -severity medium,high,critical -proxy $PROXY -silent -o nuclei-cve.txt"
-    # FIX #3 + #5: Suppress all nuclei stdout/stderr
+    cmd="cat live.txt | timeout $TIMEOUT_NUCLEI_CVE nuclei ${templates_flag} -rate-limit $NUCLEI_RATE -severity medium,high,critical -silent -o nuclei-cve.txt"
+    [ -n "$PROXY" ] && cmd="cat live.txt | timeout $TIMEOUT_NUCLEI_CVE nuclei ${templates_flag} -rate-limit $NUCLEI_RATE -severity medium,high,critical -proxy $PROXY -silent -o nuclei-cve.txt"
     eval "$cmd >/dev/null 2>&1" || true
 
     log INFO "Scan secrets..."
-    cmd="cat live.txt | timeout $TIMEOUT_NUCLEI_SECRETS nuclei -rate-limit $NUCLEI_RATE -tags token,exposure,default-login -silent -o nuclei-secrets.txt"
-    [ -n "$PROXY" ] && cmd="cat live.txt | timeout $TIMEOUT_NUCLEI_SECRETS nuclei -rate-limit $NUCLEI_RATE -tags token,exposure,default-login -proxy $PROXY -silent -o nuclei-secrets.txt"
+    cmd="cat live.txt | timeout $TIMEOUT_NUCLEI_SECRETS nuclei ${templates_flag} -rate-limit $NUCLEI_RATE -tags token,exposure,default-login -silent -o nuclei-secrets.txt"
+    [ -n "$PROXY" ] && cmd="cat live.txt | timeout $TIMEOUT_NUCLEI_SECRETS nuclei ${templates_flag} -rate-limit $NUCLEI_RATE -tags token,exposure,default-login -proxy $PROXY -silent -o nuclei-secrets.txt"
     eval "$cmd >/dev/null 2>&1" || true
 
     log OK "Nuclei CVE: $(wc -l < nuclei-cve.txt 2>/dev/null || echo 0)"
@@ -561,8 +627,9 @@ run_parallel_phase_3() {
     local ferox_wordlist="$2"
 
     log_banner "FUZZING (parallele)"
-    run_gf &
-    local pid_gf=$!
+
+    # GF doit terminer avant FFUF car ffuf lit gf-xss.txt
+    run_gf
 
     run_ffuf_xss "$xss_wordlist" &
     local pid_ffuf=$!
@@ -570,7 +637,7 @@ run_parallel_phase_3() {
     run_feroxbuster "$ferox_wordlist" &
     local pid_ferox=$!
 
-    wait $pid_gf $pid_ffuf $pid_ferox
+    wait $pid_ffuf $pid_ferox
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -648,7 +715,34 @@ main() {
     local START_TIME
     START_TIME=$(date +%s)
 
-    clear
+    # Parsing des options (remplit REMAINING_ARGS)
+    parse_args "$@"
+    set -- "${REMAINING_ARGS[@]}"
+
+    RAW_TARGET="${1:?Erreur: target requis}"
+    PROXY="${2:-}"
+
+    # Normaliser la cible (retire scheme/www/trailing slash)
+    TARGET="$(echo "$RAW_TARGET" | sed 's|^https\?://||;s|^www\.||;s|/$||')"
+
+    # Nom de dossier safe: ne garder que A-Za-z0-9._-, le reste -> _
+    TARGET_SAFE="$(printf '%s\n' "$TARGET" | sed 's/[^A-Za-z0-9._-]/_/g')"
+
+    local TIMESTAMP
+    TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
+    OUTPUT_DIR="bb-${TARGET_SAFE}-${TIMESTAMP}"
+
+    mkdir -p "$OUTPUT_DIR"
+    cd "$OUTPUT_DIR"
+
+    LOG_FILE="execution.log"
+    : > "$LOG_FILE"
+
+    # Clear uniquement si stdout est un terminal
+    if [ -t 1 ]; then
+        clear
+    fi
+
     printf "================================================================================\n"
     printf "Bug Bounty Automator v2.3 - PATCHED\n"
     printf "================================================================================\n\n"
@@ -664,26 +758,38 @@ main() {
     local ferox_wordlist
     ferox_wordlist=$(check_wordlists)
 
-    local templates_path
-    templates_path=$(setup_nuclei)
+    # Configure nuclei (définit NUCLEI_TEMPLATES_PATH)
+    setup_nuclei
 
-    log_banner "CONFIGURATION WORDLIST XSS"
-    echo "  [1] SecLists XSS (Jhaddix)"
-    echo "  [2] Personnalise (chemin)"
-    echo "  [3] Skip FFUF"
-    echo ""
-    read -r -p "Choix (1-3): " xss_choice
-
+    # Choix wordlist XSS (mode interactif / non-interactif)
     local xss_wordlist=""
-    case "${xss_choice:-3}" in
-        1) xss_wordlist="/usr/share/seclists/Fuzzing/XSS/XSS-Jhaddix.txt" ;;
-        2) read -r -p "Chemin: " xss_wordlist ;;
-        *) xss_wordlist="" ;;
-    esac
+    log_banner "CONFIGURATION WORDLIST XSS"
 
-    if [ -n "$xss_wordlist" ] && [ ! -f "$xss_wordlist" ]; then
-        log WARN "Wordlist XSS introuvable -> FFUF skip"
-        xss_wordlist=""
+    if [ "$NON_INTERACTIVE" = true ]; then
+        xss_wordlist="/usr/share/seclists/Fuzzing/XSS/XSS-Jhaddix.txt"
+        if [ -f "$xss_wordlist" ]; then
+            log OK "Mode non-interactif: XSS wordlist Jhaddix"
+        else
+            log WARN "Wordlist XSS Jhaddix introuvable -> FFUF skip (non-interactif)"
+            xss_wordlist=""
+        fi
+    else
+        echo "  [1] SecLists XSS (Jhaddix)"
+        echo "  [2] Personnalise (chemin)"
+        echo "  [3] Skip FFUF"
+        echo ""
+        read -r -p "Choix (1-3): " xss_choice
+
+        case "${xss_choice:-3}" in
+            1) xss_wordlist="/usr/share/seclists/Fuzzing/XSS/XSS-Jhaddix.txt" ;;
+            2) read -r -p "Chemin: " xss_wordlist ;;
+            *) xss_wordlist="" ;;
+        esac
+
+        if [ -n "$xss_wordlist" ] && [ ! -f "$xss_wordlist" ]; then
+            log WARN "Wordlist XSS introuvable -> FFUF skip"
+            xss_wordlist=""
+        fi
     fi
 
     log_banner "EXECUTION"
