@@ -4,7 +4,7 @@
 # Bug Bounty Automator v2.3
 
 Script Bash de **reconnaissance automatisée** pour bug bounty et audit web.  
-Il enchaîne l’énumération, la validation HTTP, le crawling, le scan de vulnérabilités, la détection de takeovers, le pattern matching et le fuzzing, puis génère un rapport final.[web:45][web:48]
+Il enchaîne l’énumération, la validation HTTP, le crawling, le scan de vulnérabilités, la détection de takeovers, le pattern matching et le fuzzing, puis génère un rapport final.
 
 ## Objectif
 
